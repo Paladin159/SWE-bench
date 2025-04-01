@@ -170,3 +170,5 @@ cython_debug/
 data/repos/copies
 notebooks/
 *logs/
+
+modal_eval.bak

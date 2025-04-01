@@ -1,3 +1,65 @@
 [build-system]
-requires = ['setuptools>=42']
-build-backend = 'setuptools.build_meta'
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "swebench"
+version = "0.1.0"
+description = "The official SWE-bench package - a benchmark for evaluating LMs on software engineering"
+readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT License"}
+keywords = ["nlp", "benchmark", "code"]
+dependencies = [
+    "beautifulsoup4",
+    "chardet",
+    "datasets",
+    "docker",
+    "ghapi",
+    "GitPython",
+    "modal",
+    "pre-commit",
+    "python-dotenv",
+    "requests",
+    "rich",
+    "tenacity",
+    "tqdm",
+    "unidiff"
+]
+
+[project.urls]
+Documentation = "https://github.com/swe-bench/SWE-bench"
+"Bug Reports" = "http://github.com/swe-bench/SWE-bench/issues"
+"Source Code" = "http://github.com/swe-bench/SWE-bench"
+Website = "https://swebench.com"
+
+[project.scripts]
+# An example entry point—adjust the target to the module and function you use for uv run.
+swebench = "swebench.harness.run_evaluation:main"
+
+[project.optional-dependencies]
+inference = [
+    "anthropic",
+    "flash_attn",
+    "jedi",
+    "openai",
+    "peft",
+    "protobuf",
+    "sentencepiece",
+    "tiktoken",
+    "torch",
+    "transformers",
+    "triton"
+]
+test = [
+    "pytest",
+    "pytest-cov"
+]
+
+[tool.uvicorn]
+# Example uvicorn configuration if you plan to use uvicorn's CLI to launch your app;
+# adjust the app setting to point to your ASGI app if applicable.
+app = "swebench.harness.run_evaluation:app"
+host = "0.0.0.0"
+port = 8000
+log-level = "info"
