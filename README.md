@@ -1,1 +1,1 @@
-A fork of SWE-bench that uses Morph Cloud instead of Modal for cloud-based evaluations. Check [assets/evaluation.md](https://github.com/Paladin159/SWE-bench/blob/d73f8ae6af7929c38e0ef5adbe8c59100e642cff/assets/evaluation.md) for instructions.
+A fork of SWE-bench that uses Morph Cloud instead of Modal for cloud-based evaluations. Check [assets/evaluation.md](https://github.com/Paladin159/SWE-bench/blob/6068443aeb9d133807ac8ae8c812df7760ef4b52/assets/evaluation.md) for instructions.
