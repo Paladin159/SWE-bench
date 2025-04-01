@@ -45,7 +45,7 @@ from swebench.harness.docker_build import (
 )
 from swebench.harness.grading import get_eval_report
 from swebench.harness.reporting import make_run_report
-from swebench.harness.morph_eval import run_instances_morph
+from swebench.harness.morph_eval import process_instances_distributed
 
 from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
 from swebench.harness.utils import (
@@ -491,7 +491,7 @@ def main(
         if not dataset:
             print("No instances to run.")
         else:
-            run_instances_morph(predictions, dataset, full_dataset, run_id, timeout, max_workers)
+            process_instances_distributed(predictions, dataset, full_dataset, run_id, max_workers)
         return
 
     # run instances locally
