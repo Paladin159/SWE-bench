@@ -4,6 +4,7 @@ import docker
 import json
 import platform
 import traceback
+import asyncio
 
 if platform.system() == "Linux":
     import resource
@@ -491,7 +492,7 @@ def main(
         if not dataset:
             print("No instances to run.")
         else:
-            process_instances_distributed(predictions, dataset, full_dataset, run_id, max_workers)
+            asyncio.run(process_instances_distributed(predictions, dataset, full_dataset, run_id, max_workers))
         return
 
     # run instances locally

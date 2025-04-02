@@ -116,7 +116,7 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
             test_queue.put_nowait(test_spec)
     results = []
 
-    async def process_instance(pred: dict, run_id: str) -> None:
+    async def process_instance(pred: dict, run_id: str):
         """
         Do the remaining work (patch application, running eval, logging, reporting)
         on the Morph Cloud instance yielded by base_snapshot_context.
@@ -136,10 +136,10 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
                 try:
                     async with base_snapshot_context(test_spec) as morphvm:
                         if patch_diff:
-                            await morphvm.aexec(command=f"bash -c 'echo \"{patch_diff}\" > /tmp/patch.diff'")
-                            apply_patch_resp = await morphvm.aexec(command="cd /testbed && git apply -v /tmp/patch.diff")
+                            await morphvm.aexec(command=f'bash -c \'printf "%s" "{patch_diff}" > /root/patch.diff\'')
+                            apply_patch_resp = await morphvm.aexec(command="cd /testbed && git apply -v /root/patch.diff")
                             if apply_patch_resp.exit_code != 0:
-                                apply_patch_resp = await morphvm.aexec(command="cd /testbed && patch --batch --fuzz=5 -p1 -i /tmp/patch.diff")
+                                apply_patch_resp = await morphvm.aexec(command="cd /testbed && patch --batch --fuzz=5 -p1 -i /root/patch.diff")
                                 if apply_patch_resp.exit_code != 0:
                                     raise Exception(f"Patch failed:\n{apply_patch_resp.stdout}\n{apply_patch_resp.stderr}")
                         await morphvm.aexec(command="cd /testbed && git diff")
@@ -166,16 +166,17 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
                             instance_id=test_spec.instance_id,
                             test_output=test_output,
                             report_json_str=json.dumps(report, indent=4),
-                            run_instance_log=log_file.read_text(),
                             patch_diff=patch_diff,
                             log_dir=log_dir,
                             errored=False,
+                            run_instance_log=""
                         ))
                 except Exception:
                     error_msg = traceback.format_exc()
                     with open(log_file, "w", encoding="utf-8") as lf:
                         lf.write(error_msg)
                     logging.error(f"Error processing test_spec {test_spec.instance_id}", exc_info=True)
+                    log_contents = log_file.read_text() if log_file.exists() else ""
                     results.append(TestOutput(
                         instance_id=test_spec.instance_id,
                         test_output="",
