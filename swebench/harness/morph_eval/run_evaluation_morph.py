@@ -1,7 +1,6 @@
 """
-This script implements run_evaluation using Morph Cloud instead of Modal.
-It follows the same steps as run_evaluation_modal.py: building a snapshot
-via a chain of .setup() commands (including repository cloning and checkout
+This script implements run_evaluation using Morph Cloud. It builds a snapshot
+via a chain of .asetup() commands (including repository cloning and checkout
 using the environment_setup_commit), starting an instance, applying a patch,
 running tests and generating a report.
 """
@@ -128,7 +127,7 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
                 instance_id = test_spec.instance_id
                 this_pred = pred[instance_id]
                 # Setup logging directory:
-                log_dir = RUN_EVALUATION_LOG_DIR / run_id / test_spec.repo.replace("/", "__") / instance_id
+                log_dir = RUN_EVALUATION_LOG_DIR / run_id / this_pred.get("model_name_or_path", "None").replace("/", "__") / instance_id
                 log_dir.mkdir(parents=True, exist_ok=True)
                 log_file = log_dir / "run_instance.log"
                 # Retrieve any patch diff from the prediction:
@@ -136,10 +135,15 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
                 try:
                     async with base_snapshot_context(test_spec) as morphvm:
                         if patch_diff:
-                            await morphvm.aexec(command=f'bash -c \'printf "%s" "{patch_diff}" > /root/patch.diff\'')
-                            apply_patch_resp = await morphvm.aexec(command="cd /testbed && git apply -v /root/patch.diff")
+                            # Write the patch to /tmp/patch.diff using a robust quoting scheme.
+                            await morphvm.aexec(command=f'bash -c "printf \'%s\' \'{patch_diff}\' > /tmp/patch.diff"')
+                            # Optionally, check the patch file contents for diagnostics.
+                            diagnostic = await morphvm.aexec(command="cat /tmp/patch.diff")
+                            logging.error(f"Diagnostic patch file content: {diagnostic.stdout}")
+                            # Attempt to apply the patch.
+                            apply_patch_resp = await morphvm.aexec(command="cd /testbed && git apply -v /tmp/patch.diff")
                             if apply_patch_resp.exit_code != 0:
-                                apply_patch_resp = await morphvm.aexec(command="cd /testbed && patch --batch --fuzz=5 -p1 -i /root/patch.diff")
+                                apply_patch_resp = await morphvm.aexec(command="cd /testbed && patch --batch --fuzz=5 -p1 -i /tmp/patch.diff")
                                 if apply_patch_resp.exit_code != 0:
                                     raise Exception(f"Patch failed:\n{apply_patch_resp.stdout}\n{apply_patch_resp.stderr}")
                         await morphvm.aexec(command="cd /testbed && git diff")
@@ -172,16 +176,22 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
                             run_instance_log=""
                         ))
                 except Exception:
+                    # Capture all exceptions from inside the VM context.
                     error_msg = traceback.format_exc()
+                    # Write error to log file.
                     with open(log_file, "w", encoding="utf-8") as lf:
                         lf.write(error_msg)
                     logging.error(f"Error processing test_spec {test_spec.instance_id}", exc_info=True)
-                    log_contents = log_file.read_text() if log_file.exists() else ""
+                    # Wait up to 30 seconds for the log file to be flushed.
+                    start_wait = time.time()
+                    while not log_file.exists() and time.time() - start_wait < 5:
+                        await asyncio.sleep(1)
+                    log_contents = log_file.read_text() if log_file.exists() else "ERROR - log file not found"
                     results.append(TestOutput(
                         instance_id=test_spec.instance_id,
                         test_output="",
                         report_json_str="",
-                        run_instance_log=log_file.read_text(),
+                        run_instance_log=log_contents,
                         patch_diff=patch_diff,
                         log_dir=log_dir,
                         errored=True,
@@ -214,7 +224,6 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
             except Exception:
                 logging.error(f"{result.instance_id}: Error writing report.json", exc_info=True)
                 print(f"{result.instance_id}: no report.json")
-
     make_run_report(predictions, full_dataset, run_id)
 
 async def main(
@@ -308,17 +317,15 @@ if __name__ == "__main__":
                 test_output_file = (
                     RUN_EVALUATION_LOG_DIR
                     / run_id
-                    / prediction["model_name_or_path"].replace("/", "__")
+                    / prediction.get("model_name_or_path", "None").replace("/", "__")
                     / prediction[KEY_INSTANCE_ID]
                     / "test_output.txt"
                 )
                 if test_output_file.exists():
                     test_output_ids.add(instance[KEY_INSTANCE_ID])
             dataset = [
-                i
-                for i in dataset
-                if i[KEY_INSTANCE_ID] in prediction_ids
-                and i[KEY_INSTANCE_ID] in test_output_ids
+                i for i in dataset
+                if i[KEY_INSTANCE_ID] in prediction_ids and i[KEY_INSTANCE_ID] in test_output_ids
             ]
             return dataset
 
@@ -332,7 +339,7 @@ if __name__ == "__main__":
             report_file = (
                 RUN_EVALUATION_LOG_DIR
                 / run_id
-                / prediction[KEY_MODEL].replace("/", "__")
+                / prediction.get("model_name_or_path", "None").replace("/", "__")
                 / prediction[KEY_INSTANCE_ID]
                 / LOG_REPORT
             )
