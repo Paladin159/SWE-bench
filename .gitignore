@@ -172,3 +172,5 @@ notebooks/
 *logs/
 
 modal_eval.bak
+logs
+Augment_Agent*

@@ -58,35 +58,29 @@ async def base_snapshot_context(test_spec: TestSpec):
         digest="swebench-base"
     )
     # Common steps executed once
-    snapshot = ( 
-        snapshot.setup("apt update -y")
-        .setup("export DEBIAN_FRONTEND=noninteractive && export TZ='Etc/UTC'")
-        .setup("apt install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata patch")
+    snapshot = await snapshot.asetup("apt-get update -q")
+    snapshot = await snapshot.asetup("export DEBIAN_FRONTEND=noninteractive && export TZ='Etc/UTC'")
+    snapshot = await snapshot.asetup("apt install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata patch")
     # Install Miniconda
-        .setup("wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_23.11.0-2-Linux-x86_64.sh' -O miniconda.sh")
-        .setup("bash miniconda.sh -b -p /opt/miniconda3")
-        .setup("echo 'export PATH=/opt/miniconda3/bin:$PATH' >> ~/.bashrc")
-        .setup("/opt/miniconda3/bin/conda init --all")
-        .setup("/opt/miniconda3/bin/conda config --append channels conda-forge")
-        .setup("adduser --disabled-password --gecos 'dog' nonroot")
-        .setup("mkdir -p /testbed")
-    )
+    snapshot = await snapshot.asetup("wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_23.11.0-2-Linux-x86_64.sh' -O miniconda.sh")
+    snapshot = await snapshot.asetup("bash miniconda.sh -b -p /opt/miniconda3")
+    snapshot = await snapshot.asetup("echo 'export PATH=/opt/miniconda3/bin:$PATH' >> ~/.bashrc")
+    snapshot = await snapshot.asetup("/opt/miniconda3/bin/conda init --all")
+    snapshot = await snapshot.asetup("/opt/miniconda3/bin/conda config --append channels conda-forge")
+    snapshot = await snapshot.asetup("adduser --disabled-password --gecos 'dog' nonroot")
+    snapshot = await snapshot.asetup("mkdir -p /testbed")
     env_script = test_spec.setup_env_script
     if env_script:
-        snapshot = (
-            snapshot.setup(f"cat <<'EOF' > /root/setup_env.sh\n{env_script}\nEOF")
-            .setup("chmod +x /root/setup_env.sh")
-            .setup("bash -c 'source ~/.bashrc && /root/setup_env.sh'")
-            .setup("echo 'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed' >> /root/.bashrc")
-        )
+        snapshot = await snapshot.asetup(f"cat <<'EOF' > /root/setup_env.sh\n{env_script}\nEOF")
+        snapshot = await snapshot.asetup("chmod +x /root/setup_env.sh")
+        snapshot = await snapshot.asetup("bash -c 'source ~/.bashrc && /root/setup_env.sh'")
+        snapshot = await snapshot.asetup("echo 'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed' >> /root/.bashrc")
         # Inline the repository installation script from TestSpec.
     repo_script = test_spec.install_repo_script
     if repo_script:
-        snapshot = (
-            snapshot.setup(f"cat <<'EOF' > /root/setup_repo.sh\n{repo_script}\nEOF")
-            .setup("chmod +x /root/setup_repo.sh")
-            .setup("bash /root/setup_repo.sh")
-        )
+        snapshot = await snapshot.asetup(f"cat <<'EOF' > /root/setup_repo.sh\n{repo_script}\nEOF")
+        snapshot = await snapshot.asetup("chmod +x /root/setup_repo.sh")
+        snapshot = await snapshot.asetup("bash /root/setup_repo.sh")
     with client.instances.start(snapshot.id, ttl_seconds=3600) as instance:
          try:
             yield instance
@@ -132,12 +126,13 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
             try:
                 test_spec = await test_queue.get()
                 instance_id = test_spec.instance_id
+                this_pred = pred[instance_id]
                 # Setup logging directory:
                 log_dir = RUN_EVALUATION_LOG_DIR / run_id / test_spec.repo.replace("/", "__") / instance_id
                 log_dir.mkdir(parents=True, exist_ok=True)
                 log_file = log_dir / "run_instance.log"
                 # Retrieve any patch diff from the prediction:
-                patch_diff = pred.get("model_patch", "")
+                patch_diff = this_pred.get("model_patch", "")
                 try:
                     async with base_snapshot_context(test_spec) as morphvm:
                         if patch_diff:
@@ -163,7 +158,7 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
                             f.write(test_output)
                         report = get_eval_report(
                             test_spec=test_spec,
-                            prediction=pred,
+                            prediction=this_pred,
                             test_log_path=test_output_path,
                             include_tests_status=True,
                         )
@@ -192,7 +187,7 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
                     ))
             except Exception as e:
                 logging.error("Error in process_instance loop", exc_info=True)
-                break
+                continue
 
     # Run workers concurrently
     await asyncio.gather(*[process_instance(predictions, run_id) for _ in range(max_workers)])
@@ -209,7 +204,11 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
             f.write(result.patch_diff)
         with open(log_dir / "report.json", "w") as f:
             try:
-                report_json = json.loads(result.report_json_str)
+                # Only load JSON if there is content; otherwise create an empty dict.
+                if result.report_json_str and result.report_json_str.strip():
+                    report_json = json.loads(result.report_json_str)
+                else:
+                    report_json = {}
                 json.dump(report_json, f, indent=4)
             except Exception:
                 logging.error(f"{result.instance_id}: Error writing report.json", exc_info=True)
@@ -385,7 +384,7 @@ if __name__ == "__main__":
         help="Doesn't run new instances, only writes reports for instances with existing test outputs",
     )
     parser.add_argument(
-        "--report_dir", type=str, default=".", help="Directory to write reports to"
+        "--report_dir", type=str, default="logs", help="Directory to write reports to"
     )
     parser.add_argument(
         "--predictions_path",
