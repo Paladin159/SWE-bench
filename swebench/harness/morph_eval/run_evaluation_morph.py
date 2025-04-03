@@ -171,7 +171,12 @@ EOF
             # Apply django hack
             eval_script = eval_script.replace("locale-gen", "locale-gen en_US.UTF-8")
             
-            res_eval_setup = morphvm.exec(command=f'bash -c "cat > /root/eval.sh <<\'EOCOMMAND\'\n{eval_script}\nEOCOMMAND\nchmod +x /root/eval.sh"')
+            res_eval_setup = morphvm.exec(command=f"""
+                cat > /root/eval.sh <<'EOF'
+{eval_script}
+EOF
+                chmod +x /root/eval.sh
+            """)
             logger.info(f"Eval script setup: stdout: {res_eval_setup.stdout}; stderr: {res_eval_setup.stderr}")
             
             start_time = time.time()
@@ -204,6 +209,9 @@ EOF
             if git_diff_output_after != git_diff_output_before:
                 logger.info("Git diff changed after running eval script")
             
+            # Write all log files immediately in this process
+            
+            # Write test output file
             test_output_path = log_dir / "test_output.txt"
             with open(test_output_path, "w", encoding="utf-8") as f:
                 f.write(test_output)
@@ -223,23 +231,62 @@ EOF
                 f"Result for {instance_id}: resolved: {report[instance_id]['resolved']}"
             )
             
+            # Write report.json file
+            report_path = log_dir / "report.json"
+            with open(report_path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=4)
+                logger.info(f"Report for {instance_id} written to {report_path}")
+            
+            # Write the patch file
+            patch_path = log_dir / "patch.diff"
+            with open(patch_path, "w", encoding="utf-8") as f:
+                f.write(patch_diff)
+                logger.info(f"Patch for {instance_id} written to {patch_path}")
+                
+            # Write run_instance.log 
+            # This will copy the current logger's content to make sure we have a complete log
+            run_log_content = log_file.read_text() if log_file.exists() else ""
+            
             return TestOutput(
                 instance_id=test_spec.instance_id,
                 test_output=test_output,
                 report_json_str=json.dumps(report, indent=4),
                 patch_diff=patch_diff,
+                run_instance_log=run_log_content,
                 log_dir=log_dir,
                 errored=False,
-                run_instance_log=log_file.read_text() if log_file.exists() else ""
             )
     except EvaluationError:
         error_msg = traceback.format_exc()
         logger.info(error_msg)
+        
+        # Write error log and an empty report for failed runs
+        error_report = {
+            instance_id: {
+                "patch_is_None": False, 
+                "patch_exists": True,
+                "patch_successfully_applied": False,
+                "resolved": False,
+                "error": True
+            }
+        }
+        
+        report_path = log_dir / "report.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(error_report, f, indent=4)
+            logger.info(f"Error report for {instance_id} written to {report_path}")
+            
+        patch_path = log_dir / "patch.diff"
+        with open(patch_path, "w", encoding="utf-8") as f:
+            f.write(patch_diff)
+            
+        run_log_content = log_file.read_text()
+            
         return TestOutput(
             instance_id=instance_id,
             test_output="",
-            report_json_str="",
-            run_instance_log=log_file.read_text() if log_file.exists() else "",
+            report_json_str=json.dumps(error_report, indent=4),
+            run_instance_log=run_log_content,
             patch_diff=patch_diff,
             log_dir=log_dir,
             errored=True,
@@ -251,11 +298,34 @@ EOF
             f"Check ({log_file}) for more information."
         )
         logger.error(error_msg)
+        
+        # Write error log and an empty report for failed runs
+        error_report = {
+            instance_id: {
+                "patch_is_None": False, 
+                "patch_exists": True,
+                "patch_successfully_applied": False,
+                "resolved": False,
+                "error": True
+            }
+        }
+        
+        report_path = log_dir / "report.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(error_report, f, indent=4)
+            logger.info(f"Error report for {instance_id} written to {report_path}")
+            
+        patch_path = log_dir / "patch.diff"
+        with open(patch_path, "w", encoding="utf-8") as f:
+            f.write(patch_diff)
+            
+        run_log_content = log_file.read_text()
+            
         return TestOutput(
             instance_id=instance_id,
             test_output="",
-            report_json_str="",
-            run_instance_log=log_file.read_text() if log_file.exists() else "",
+            report_json_str=json.dumps(error_report, indent=4),
+            run_instance_log=run_log_content,
             patch_diff=patch_diff,
             log_dir=log_dir,
             errored=True,
@@ -294,24 +364,11 @@ def process_instances_distributed(predictions, dataset, full_dataset, run_id, ma
                 ],
             )
     
-    # Save logs for all results
+    # No need to save logs here as it's already done in process_instance_morph
+    # Just print a summary
     for result in results:
         result = cast(TestOutput, result)
-        # Save logs locally
-        log_dir = result.log_dir
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / "run_instance.log", "w") as f:
-            f.write(result.run_instance_log)
-        with open(log_dir / "test_output.txt", "w") as f:
-            f.write(result.test_output)
-        with open(log_dir / "patch.diff", "w") as f:
-            f.write(result.patch_diff)
-        with open(log_dir / "report.json", "w") as f:
-            try:
-                report_json = json.loads(result.report_json_str)
-                json.dump(report_json, f, indent=4)
-            except Exception:
-                print(f"{result.instance_id}: no report.json")
+        print(f"Instance {result.instance_id} completed (errored: {result.errored})")
 
     make_run_report(predictions, full_dataset, run_id)
 
