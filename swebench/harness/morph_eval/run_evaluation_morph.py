@@ -1,6 +1,6 @@
 """
 This script implements run_evaluation using Morph Cloud. It builds a snapshot
-via a chain of .asetup() commands (including repository cloning and checkout
+via a chain of .setup() commands (including repository cloning and checkout
 using the environment_setup_commit), starting an instance, applying a patch,
 running tests and generating a report.
 """
@@ -12,11 +12,11 @@ import traceback
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-import asyncio
-from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from typing import cast
 from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
 import logging
+import multiprocessing
 
 # Configure logging (adjust level and format as needed)
 logging.basicConfig(level=logging.ERROR, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -31,6 +31,9 @@ from swebench.harness.utils import (
 from swebench.harness.grading import get_eval_report
 from swebench.harness.test_spec.test_spec import make_test_spec, TestSpec
 from swebench.harness.constants import RUN_EVALUATION_LOG_DIR, KEY_INSTANCE_ID, KEY_PREDICTION, LOG_REPORT, KEY_MODEL
+from swebench.harness.docker_build import setup_logger
+from swebench.harness.utils import EvaluationError
+from swebench.harness.constants import APPLY_PATCH_FAIL, APPLY_PATCH_PASS, START_TEST_OUTPUT, END_TEST_OUTPUT
 
 @dataclass
 class TestOutput:
@@ -44,177 +47,254 @@ class TestOutput:
     
 client = MorphCloudClient()
 
-@asynccontextmanager
-async def base_snapshot_context(test_spec: TestSpec):
+@contextmanager
+def base_snapshot_context(test_spec: TestSpec):
     """
     Build and yield a base snapshot that contains all common installation steps.
     These steps run once and are cached.
     """
-    snapshot = await client.snapshots.acreate(
+    snapshot = client.snapshots.create(
         vcpus=4,
         memory=16384,
         disk_size=100000,
         digest="swebench-base"
     )
     # Common steps executed once
-    snapshot = await snapshot.asetup("apt-get update -q")
-    snapshot = await snapshot.asetup("export DEBIAN_FRONTEND=noninteractive && export TZ='Etc/UTC'")
-    snapshot = await snapshot.asetup("apt install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata patch")
-    # Install Miniconda
-    snapshot = await snapshot.asetup("wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_23.11.0-2-Linux-x86_64.sh' -O miniconda.sh")
-    snapshot = await snapshot.asetup("bash miniconda.sh -b -p /opt/miniconda3")
-    snapshot = await snapshot.asetup("echo 'export PATH=/opt/miniconda3/bin:$PATH' >> ~/.bashrc")
-    snapshot = await snapshot.asetup("/opt/miniconda3/bin/conda init --all")
-    snapshot = await snapshot.asetup("/opt/miniconda3/bin/conda config --append channels conda-forge")
-    snapshot = await snapshot.asetup("adduser --disabled-password --gecos 'dog' nonroot")
-    snapshot = await snapshot.asetup("mkdir -p /testbed")
+    snapshot = (snapshot.setup("apt-get update -q")
+        .setup("export DEBIAN_FRONTEND=noninteractive && export TZ='Etc/UTC'")
+        .setup("apt install -y wget git build-essential libffi-dev libtiff-dev jq curl locales locales-all tzdata patch")
+        # Install Miniconda
+        .setup("wget 'https://repo.anaconda.com/miniconda/Miniconda3-py311_23.11.0-2-Linux-x86_64.sh' -O miniconda.sh")
+        .setup("bash miniconda.sh -b -p /opt/miniconda3")
+        .setup("echo 'export PATH=/opt/miniconda3/bin:$PATH' >> ~/.bashrc")
+        .setup("/opt/miniconda3/bin/conda init --all")
+        .setup("/opt/miniconda3/bin/conda config --append channels conda-forge")
+        .setup("adduser --disabled-password --gecos 'dog' nonroot")
+        .setup("mkdir -p /testbed")
+    )
+    
     env_script = test_spec.setup_env_script
     if env_script:
-        snapshot = await snapshot.asetup(f"cat <<'EOF' > /root/setup_env.sh\n{env_script}\nEOF")
-        snapshot = await snapshot.asetup("chmod +x /root/setup_env.sh")
-        snapshot = await snapshot.asetup("bash -c 'source ~/.bashrc && /root/setup_env.sh'")
-        snapshot = await snapshot.asetup("echo 'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed' >> /root/.bashrc")
-        # Inline the repository installation script from TestSpec.
+        snapshot = (snapshot
+            .setup(f"""
+                cat > /root/setup_env.sh <<'EOF'
+{env_script}
+EOF
+                   """)
+            .setup("chmod +x /root/setup_env.sh")
+            .setup("bash -c 'source ~/.bashrc && /root/setup_env.sh'")
+            .setup("echo 'source /opt/miniconda3/etc/profile.d/conda.sh && conda activate testbed' >> /root/.bashrc")
+        )
+        
+    # Inline the repository installation script from TestSpec.
     repo_script = test_spec.install_repo_script
     if repo_script:
-        snapshot = await snapshot.asetup(f"cat <<'EOF' > /root/setup_repo.sh\n{repo_script}\nEOF")
-        snapshot = await snapshot.asetup("chmod +x /root/setup_repo.sh")
-        snapshot = await snapshot.asetup("bash /root/setup_repo.sh")
+        snapshot = (snapshot
+            .setup(f"""
+                cat > /root/setup_repo.sh <<'EOF' 
+{repo_script}
+EOF
+                """)
+            .setup("chmod +x /root/setup_repo.sh")
+            .setup("bash /root/setup_repo.sh")
+        )
+    
     with client.instances.start(snapshot.id, ttl_seconds=3600) as instance:
-         try:
+        try:
             yield instance
-         finally:
+        finally:
             pass
 
-async def get_log_dir(pred: dict, run_id: str, instance_id: str) -> Path:
+def get_log_dir(pred: dict, run_id: str, instance_id: str) -> Path:
     model_name_or_path = cast(
         str, pred.get("model_name_or_path", "None").replace("/", "__")
     )
     return RUN_EVALUATION_LOG_DIR / run_id / model_name_or_path / instance_id
 
+def process_instance_morph(test_spec, pred, run_id) -> TestOutput:
+    """
+    Do the remaining work (patch application, running eval, logging, reporting)
+    on the Morph Cloud instance yielded by base_snapshot_context.
+    """
+    instance_id = test_spec.instance_id
+    # Setup logging directory:
+    log_dir = get_log_dir(pred, run_id, instance_id)
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "run_instance.log"
+    logger = setup_logger(instance_id, log_file, add_stdout=True)
+    
+    # Retrieve any patch diff from the prediction:
+    patch_diff = pred.get("model_patch", "")
+    
+    try:
+        with base_snapshot_context(test_spec) as morphvm:
+            if patch_diff:
+                # Write the patch to /tmp/patch.diff
+                res = morphvm.exec(command=f"""
+                    cat > /tmp/patch.diff <<'EOF'
+{patch_diff}
+EOF
+                """)
+                logger.info(f"Wrote patch file: stdout: {res.stdout}; stderr: {res.stderr}")
+                
+                # Attempt to apply the patch
+                apply_patch_resp = morphvm.exec(command="cd /testbed && git apply -v /tmp/patch.diff")
+                apply_patch_output = apply_patch_resp.stdout + "\n" + apply_patch_resp.stderr
+                returncode = apply_patch_resp.exit_code
+                
+                if returncode != 0:
+                    logger.info("Failed to apply patch to container, trying again...")
+                    
+                    apply_patch_resp = morphvm.exec(command="cd /testbed && patch --batch --fuzz=5 -p1 -i /tmp/patch.diff")
+                    apply_patch_output = apply_patch_resp.stdout + "\n" + apply_patch_resp.stderr
+                    returncode = apply_patch_resp.exit_code
+                    
+                    if returncode != 0:
+                        logger.info(f"{APPLY_PATCH_FAIL}:\n{apply_patch_output}")
+                        raise EvaluationError(
+                            instance_id,
+                            f"{APPLY_PATCH_FAIL}:\n{apply_patch_output}",
+                            logger,
+                        )
+                    else:
+                        logger.info(f"{APPLY_PATCH_PASS}:\n{apply_patch_output}")
+                else:
+                    logger.info(f"{APPLY_PATCH_PASS}:\n{apply_patch_output}")
+            
+            # Run git diff before evaluation.
+            git_diff_resp = morphvm.exec(command="cd /testbed && git diff")
+            git_diff_output_before = git_diff_resp.stdout
+            logger.info(f"Git diff before:\n{git_diff_output_before}")
+            
+            # Write and prepare evaluation script with the django hack.
+            eval_script = test_spec.eval_script
+            # Apply django hack
+            eval_script = eval_script.replace("locale-gen", "locale-gen en_US.UTF-8")
+            
+            res_eval_setup = morphvm.exec(command=f'bash -c "cat > /root/eval.sh <<\'EOCOMMAND\'\n{eval_script}\nEOCOMMAND\nchmod +x /root/eval.sh"')
+            logger.info(f"Eval script setup: stdout: {res_eval_setup.stdout}; stderr: {res_eval_setup.stderr}")
+            
+            start_time = time.time()
+            
+            # Run command with test markers
+            run_command = "cd /testbed"
+            # Add pylint hack
+            if "pylint" in test_spec.instance_id:
+                run_command += " && PYTHONPATH="
+            # increase recursion limit for testing
+            run_command += " && python3 -c 'import sys; sys.setrecursionlimit(10000)'"
+            # Add start marker
+            run_command += f" && echo '{START_TEST_OUTPUT}'"
+            # run eval script
+            run_command += " && /bin/bash /root/eval.sh"
+            # Add end marker
+            run_command += f" && echo '{END_TEST_OUTPUT}'"
+            
+            eval_resp = morphvm.exec(command=run_command)
+            test_output = eval_resp.stdout
+            total_runtime = time.time() - start_time
+            logger.info(f"Test runtime: {total_runtime:_.2f} seconds")
+            
+            # Get git diff after running eval script
+            git_diff_resp = morphvm.exec(command="cd /testbed && git diff")
+            git_diff_output_after = git_diff_resp.stdout
 
-async def process_instances_distributed(predictions, dataset, full_dataset, run_id, max_workers):
+            # Check if git diff changed after running eval script
+            logger.info(f"Git diff after:\n{git_diff_output_after}")
+            if git_diff_output_after != git_diff_output_before:
+                logger.info("Git diff changed after running eval script")
+            
+            test_output_path = log_dir / "test_output.txt"
+            with open(test_output_path, "w", encoding="utf-8") as f:
+                f.write(test_output)
+                logger.info(f"Test output for {instance_id} written to {test_output_path}")
+                print(f"Test output for {instance_id} written to {test_output_path}")
+                
+            # Get report from test output with logging
+            logger.info(f"Grading answer for {instance_id}...")
+            report = get_eval_report(
+                test_spec=test_spec,
+                prediction=pred,
+                test_log_path=test_output_path,
+                include_tests_status=True,
+            )
+            logger.info(
+                f"report: {report}\n"
+                f"Result for {instance_id}: resolved: {report[instance_id]['resolved']}"
+            )
+            
+            return TestOutput(
+                instance_id=test_spec.instance_id,
+                test_output=test_output,
+                report_json_str=json.dumps(report, indent=4),
+                patch_diff=patch_diff,
+                log_dir=log_dir,
+                errored=False,
+                run_instance_log=log_file.read_text() if log_file.exists() else ""
+            )
+    except EvaluationError:
+        error_msg = traceback.format_exc()
+        logger.info(error_msg)
+        return TestOutput(
+            instance_id=instance_id,
+            test_output="",
+            report_json_str="",
+            run_instance_log=log_file.read_text() if log_file.exists() else "",
+            patch_diff=patch_diff,
+            log_dir=log_dir,
+            errored=True,
+        )
+    except Exception as e:
+        error_msg = (
+            f"Error in evaluating model for {instance_id}: {e}\n"
+            f"{traceback.format_exc()}\n"
+            f"Check ({log_file}) for more information."
+        )
+        logger.error(error_msg)
+        return TestOutput(
+            instance_id=instance_id,
+            test_output="",
+            report_json_str="",
+            run_instance_log=log_file.read_text() if log_file.exists() else "",
+            patch_diff=patch_diff,
+            log_dir=log_dir,
+            errored=True,
+        )
+
+def process_instances_distributed(predictions, dataset, full_dataset, run_id, max_workers):
     """
-    Create an async queue over the test specifications and run each instance on Morph Cloud.
+    Create a process pool to process the test specifications and run each instance on Morph Cloud.
     """
-    test_queue = asyncio.Queue()
     run_test_specs = []
     test_specs = list(map(make_test_spec, dataset))
+    
     # Check for instances that have already been run
     for test_spec in test_specs:
-        log_dir = await get_log_dir(
+        log_dir = get_log_dir(
             predictions[test_spec.instance_id], run_id, test_spec.instance_id
         )
         if log_dir.exists():
             continue
         run_test_specs.append(test_spec)
 
+    results = []
     if run_test_specs:
         # Run instances that haven't been run yet
-        for test_spec in run_test_specs:
-            test_queue.put_nowait(test_spec)
-    results = []
-
-    async def process_instance(pred: dict, run_id: str):
-        """
-        Do the remaining work (patch application, running eval, logging, reporting)
-        on the Morph Cloud instance yielded by base_snapshot_context.
-        Appends TestOutput to the global results list.
-        """
-        while not test_queue.empty():
-            try:
-                test_spec = await test_queue.get()
-                instance_id = test_spec.instance_id
-                this_pred = pred[instance_id]
-                # Setup logging directory:
-                log_dir = RUN_EVALUATION_LOG_DIR / run_id / this_pred.get("model_name_or_path", "None").replace("/", "__") / instance_id
-                log_dir.mkdir(parents=True, exist_ok=True)
-                log_file = log_dir / "run_instance.log"
-                # Retrieve any patch diff from the prediction:
-                patch_diff = this_pred.get("model_patch", "")
-                try:
-                    async with base_snapshot_context(test_spec) as morphvm:
-                        if patch_diff:
-                            # Write the patch to /tmp/patch.diff using a robust quoting scheme.
-                            res = await morphvm.aexec(command=f'bash -c "printf \'%s\' \'{patch_diff}\' > /tmp/patch.diff"')
-                            logging.info(f"[{instance_id}] Wrote patch file: stdout: {res.stdout}; stderr: {res.stderr}")
-                            
-                            # Diagnostic command to check the patch file.
-                            diagnostic = await morphvm.aexec(command="cat /tmp/patch.diff")
-                            logging.info(f"[{instance_id}] Diagnostic patch file content: {diagnostic.stdout}")
-                            
-                            # Attempt to apply the patch.
-                            apply_patch_resp = await morphvm.aexec(command="cd /testbed && git apply -v /tmp/patch.diff")
-                            logging.info(f"[{instance_id}] git apply output: stdout: {apply_patch_resp.stdout}; stderr: {apply_patch_resp.stderr}")
-                            if apply_patch_resp.exit_code != 0:
-                                apply_patch_resp = await morphvm.aexec(command="cd /testbed && patch --batch --fuzz=5 -p1 -i /tmp/patch.diff")
-                                logging.info(f"[{instance_id}] fallback patch output: stdout: {apply_patch_resp.stdout}; stderr: {apply_patch_resp.stderr}")
-                                if apply_patch_resp.exit_code != 0:
-                                    raise Exception(f"Patch failed:\n{apply_patch_resp.stdout}\n{apply_patch_resp.stderr}")
-                        # Run git diff before evaluation.
-                        res_diff1 = await morphvm.aexec(command="cd /testbed && git diff")
-                        logging.info(f"[{instance_id}] First git diff: {res_diff1.stdout}")
-                        
-                        # Write and prepare evaluation script.
-                        res_eval_setup = await morphvm.aexec(command=f'bash -c "cat > /root/eval.sh <<\'EOCOMMAND\'\n{test_spec.eval_script}\nEOCOMMAND\nchmod +x /root/eval.sh"')
-                        logging.info(f"[{instance_id}] Eval script setup: stdout: {res_eval_setup.stdout}; stderr: {res_eval_setup.stderr}")
-                        
-                        start_time = time.time()
-                        run_command = (
-                            "cd /testbed && python3 -c 'import sys; sys.setrecursionlimit(10000)' "
-                            "&& /bin/bash /root/eval.sh"
-                        )
-                        eval_resp = await morphvm.aexec(command=run_command)
-                        logging.info(f"[{instance_id}] Eval command output: stdout: {eval_resp.stdout}; stderr: {eval_resp.stderr}")
-                        test_output = eval_resp.stdout
-                        total_runtime = time.time() - start_time
-                        
-                        res_diff2 = await morphvm.aexec(command="cd /testbed && git diff")
-                        logging.info(f"[{instance_id}] Second git diff: {res_diff2.stdout}")
-                        
-                        test_output_path = log_dir / "test_output.txt"
-                        with open(test_output_path, "w", encoding="utf-8") as f:
-                            f.write(test_output)
-                        report = get_eval_report(
-                            test_spec=test_spec,
-                            prediction=this_pred,
-                            test_log_path=test_output_path,
-                            include_tests_status=True,
-                        )
-                        results.append(TestOutput(
-                            instance_id=test_spec.instance_id,
-                            test_output=test_output,
-                            report_json_str=json.dumps(report, indent=4),
-                            patch_diff=patch_diff,
-                            log_dir=log_dir,
-                            errored=False,
-                            run_instance_log=""  # already written to file
-                        ))
-                except Exception:
-                    # Capture all exceptions from inside the VM context.
-                    error_msg = traceback.format_exc()
-                    with open(log_file, "w", encoding="utf-8") as lf:
-                        lf.write(error_msg)
-                    logging.error(f"[{instance_id}] Error processing test_spec", exc_info=True)
-                    start_wait = time.time()
-                    while not log_file.exists() and time.time() - start_wait < 30:
-                        await asyncio.sleep(1)
-                    log_contents = log_file.read_text() if log_file.exists() else "ERROR - log file not found"
-                    results.append(TestOutput(
-                        instance_id=test_spec.instance_id,
-                        test_output="",
-                        report_json_str="",
-                        run_instance_log=log_contents,
-                        patch_diff=patch_diff,
-                        log_dir=log_dir,
-                        errored=True,
-                    ))
-            except Exception as e:
-                logging.error("Error in process_instance loop", exc_info=True)
-                continue
-
-    # Run workers concurrently
-    await asyncio.gather(*[process_instance(predictions, run_id) for _ in range(max_workers)])
+        with multiprocessing.Pool(processes=max_workers) as pool:
+            # Use starmap to run the function with multiple arguments
+            results = pool.starmap(
+                process_instance_morph,
+                [
+                    (
+                        test_spec,
+                        predictions[test_spec.instance_id],
+                        run_id,
+                    )
+                    for test_spec in run_test_specs
+                ],
+            )
+    
+    # Save logs for all results
     for result in results:
         result = cast(TestOutput, result)
         # Save logs locally
@@ -228,18 +308,14 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
             f.write(result.patch_diff)
         with open(log_dir / "report.json", "w") as f:
             try:
-                # Only load JSON if there is content; otherwise create an empty dict.
-                if result.report_json_str and result.report_json_str.strip():
-                    report_json = json.loads(result.report_json_str)
-                else:
-                    report_json = {}
+                report_json = json.loads(result.report_json_str)
                 json.dump(report_json, f, indent=4)
             except Exception:
-                logging.error(f"{result.instance_id}: Error writing report.json", exc_info=True)
                 print(f"{result.instance_id}: no report.json")
+
     make_run_report(predictions, full_dataset, run_id)
 
-async def main(
+def main(
     dataset_name: str,
     split: str,
     instance_ids: list,
@@ -278,7 +354,7 @@ async def main(
         dataset_name, split, instance_ids, predictions, run_id, rewrite_reports
     )
     full_dataset = load_swebench_dataset(dataset_name, split, instance_ids)
-    return await process_instances_distributed(predictions, dataset, full_dataset, run_id, max_workers)
+    return process_instances_distributed(predictions, dataset, full_dataset, run_id, max_workers)
 
 
 if __name__ == "__main__":
@@ -426,4 +502,4 @@ if __name__ == "__main__":
         "--namespace", type=str, default="swebench", help="Namespace for images"
     )
     args = parser.parse_args()
-    asyncio.run(main(**vars(args)))
+    main(**vars(args))

@@ -492,7 +492,7 @@ def main(
         if not dataset:
             print("No instances to run.")
         else:
-            asyncio.run(process_instances_distributed(predictions, dataset, full_dataset, run_id, max_workers))
+            process_instances_distributed(predictions, dataset, full_dataset, run_id, max_workers)
         return
 
     # run instances locally
