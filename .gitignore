@@ -176,3 +176,4 @@ logs
 Augment_Agent*
 gold.run*
 swebench/harness/morph_eval/run_eval_morph_2.py
+test_env

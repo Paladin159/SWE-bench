@@ -50,10 +50,10 @@ async def base_snapshot_context(test_spec: TestSpec):
     Build and yield a base snapshot that contains all common installation steps.
     These steps run once and are cached.
     """
-    snapshot = client.snapshots.create(
+    snapshot = await client.snapshots.acreate(
         vcpus=4,
-        memory=8192,
-        disk_size=20000,
+        memory=16384,
+        disk_size=100000,
         digest="swebench-base"
     )
     # Common steps executed once
@@ -136,27 +136,42 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
                     async with base_snapshot_context(test_spec) as morphvm:
                         if patch_diff:
                             # Write the patch to /tmp/patch.diff using a robust quoting scheme.
-                            await morphvm.aexec(command=f'bash -c "printf \'%s\' \'{patch_diff}\' > /tmp/patch.diff"')
-                            # Optionally, check the patch file contents for diagnostics.
+                            res = await morphvm.aexec(command=f'bash -c "printf \'%s\' \'{patch_diff}\' > /tmp/patch.diff"')
+                            logging.info(f"[{instance_id}] Wrote patch file: stdout: {res.stdout}; stderr: {res.stderr}")
+                            
+                            # Diagnostic command to check the patch file.
                             diagnostic = await morphvm.aexec(command="cat /tmp/patch.diff")
-                            logging.error(f"Diagnostic patch file content: {diagnostic.stdout}")
+                            logging.info(f"[{instance_id}] Diagnostic patch file content: {diagnostic.stdout}")
+                            
                             # Attempt to apply the patch.
                             apply_patch_resp = await morphvm.aexec(command="cd /testbed && git apply -v /tmp/patch.diff")
+                            logging.info(f"[{instance_id}] git apply output: stdout: {apply_patch_resp.stdout}; stderr: {apply_patch_resp.stderr}")
                             if apply_patch_resp.exit_code != 0:
                                 apply_patch_resp = await morphvm.aexec(command="cd /testbed && patch --batch --fuzz=5 -p1 -i /tmp/patch.diff")
+                                logging.info(f"[{instance_id}] fallback patch output: stdout: {apply_patch_resp.stdout}; stderr: {apply_patch_resp.stderr}")
                                 if apply_patch_resp.exit_code != 0:
                                     raise Exception(f"Patch failed:\n{apply_patch_resp.stdout}\n{apply_patch_resp.stderr}")
-                        await morphvm.aexec(command="cd /testbed && git diff")
-                        await morphvm.aexec(command=f"bash -c 'echo \"{test_spec.eval_script}\" > /root/eval.sh && chmod +x /root/eval.sh'")
+                        # Run git diff before evaluation.
+                        res_diff1 = await morphvm.aexec(command="cd /testbed && git diff")
+                        logging.info(f"[{instance_id}] First git diff: {res_diff1.stdout}")
+                        
+                        # Write and prepare evaluation script.
+                        res_eval_setup = await morphvm.aexec(command=f'bash -c "cat > /root/eval.sh <<\'EOCOMMAND\'\n{test_spec.eval_script}\nEOCOMMAND\nchmod +x /root/eval.sh"')
+                        logging.info(f"[{instance_id}] Eval script setup: stdout: {res_eval_setup.stdout}; stderr: {res_eval_setup.stderr}")
+                        
                         start_time = time.time()
                         run_command = (
                             "cd /testbed && python3 -c 'import sys; sys.setrecursionlimit(10000)' "
                             "&& /bin/bash /root/eval.sh"
                         )
                         eval_resp = await morphvm.aexec(command=run_command)
+                        logging.info(f"[{instance_id}] Eval command output: stdout: {eval_resp.stdout}; stderr: {eval_resp.stderr}")
                         test_output = eval_resp.stdout
                         total_runtime = time.time() - start_time
-                        await morphvm.aexec(command="cd /testbed && git diff")
+                        
+                        res_diff2 = await morphvm.aexec(command="cd /testbed && git diff")
+                        logging.info(f"[{instance_id}] Second git diff: {res_diff2.stdout}")
+                        
                         test_output_path = log_dir / "test_output.txt"
                         with open(test_output_path, "w", encoding="utf-8") as f:
                             f.write(test_output)
@@ -173,18 +188,16 @@ async def process_instances_distributed(predictions, dataset, full_dataset, run_
                             patch_diff=patch_diff,
                             log_dir=log_dir,
                             errored=False,
-                            run_instance_log=""
+                            run_instance_log=""  # already written to file
                         ))
                 except Exception:
                     # Capture all exceptions from inside the VM context.
                     error_msg = traceback.format_exc()
-                    # Write error to log file.
                     with open(log_file, "w", encoding="utf-8") as lf:
                         lf.write(error_msg)
-                    logging.error(f"Error processing test_spec {test_spec.instance_id}", exc_info=True)
-                    # Wait up to 30 seconds for the log file to be flushed.
+                    logging.error(f"[{instance_id}] Error processing test_spec", exc_info=True)
                     start_wait = time.time()
-                    while not log_file.exists() and time.time() - start_wait < 5:
+                    while not log_file.exists() and time.time() - start_wait < 30:
                         await asyncio.sleep(1)
                     log_contents = log_file.read_text() if log_file.exists() else "ERROR - log file not found"
                     results.append(TestOutput(
