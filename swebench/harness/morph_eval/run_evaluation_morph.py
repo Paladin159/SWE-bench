@@ -1,3 +1,13 @@
+# /// script
+# requires-python = ">=3.13"
+# dependencies = [
+#     "morphcloud",
+#     "swebench",
+# ]
+#
+# [tool.uv.sources]
+# swebench = { git = "https://github.com/SWE-bench/SWE-bench" }
+# ///
 """
 This script implements run_evaluation using Morph Cloud. It builds a snapshot
 via a chain of .setup() commands (including repository cloning and checkout
